@@ -1,2 +1,2 @@
-# ZeroSh
+# zerosh
 Shell written in Rust.
