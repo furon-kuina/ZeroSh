@@ -1,9 +1,15 @@
-use nix::sys::wait::waitpid;
-use nix::unistd::execvp;
-use nix::unistd::{fork, ForkResult};
-use std::ffi::CString;
-use std::io::{stdin, stdout, Write};
-
+use nix::{
+    errno::Errno,
+    sys::{
+        signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
+        wait::waitpid,
+    },
+    unistd::{close, execvp, fork, getpgrp, pipe, read, setpgid, tcsetpgrp, ForkResult},
+};
+use std::{
+    ffi::CString,
+    io::{stdin, stdout, Write},
+};
 mod parser;
 use parser::parse_command_line;
 
@@ -12,6 +18,8 @@ fn main() {
 }
 
 fn shell_loop() {
+    ignore_tty_signals();
+
     while let Some(input) = read_line() {
         let piped_commands = match parse_command_line(input) {
             Some(action) => action,
@@ -34,16 +42,33 @@ fn execute_piped_commands(piped_commands: Vec<String>) {
 }
 
 fn execute_unit_command(command: Vec<String>) {
+    let (pipe_read, pipe_write) = pipe().unwrap();
+
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {
-            match waitpid(child, None) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("wait error: {}", e);
-                }
-            };
+            setpgid(child, child).unwrap();
+
+            tcsetpgrp(0, child).unwrap();
+
+            close(pipe_read).unwrap();
+            close(pipe_write).unwrap();
+
+            waitpid(child, None).ok();
+
+            tcsetpgrp(0, getpgrp()).unwrap();
         }
         Ok(ForkResult::Child) => {
+            restore_tty_signals();
+            close(pipe_write).unwrap();
+
+            loop {
+                let mut buf = [0];
+                match read(pipe_read, &mut buf) {
+                    Err(e) if e == Errno::EINTR => (),
+                    _ => break,
+                }
+            }
+
             let args = command
                 .into_iter()
                 .map(|c| CString::new(c).unwrap())
@@ -60,16 +85,6 @@ fn execute_unit_command(command: Vec<String>) {
         }
         Err(e) => {
             eprintln!("fork error: {}", e);
-        }
-    }
-}
-
-fn parse_line(line: String) -> Option<Vec<String>> {
-    match line.is_empty() {
-        true => None,
-        false => {
-            let commands = line.split(' ').map(|s| s.to_string()).collect();
-            Some(commands)
         }
     }
 }
@@ -91,5 +106,23 @@ fn read_line() -> Option<String> {
             eprintln!("{}", e);
             None
         }
+    }
+}
+
+fn ignore_tty_signals() {
+    let sa = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    unsafe {
+        sigaction(Signal::SIGTSTP, &sa).unwrap();
+        sigaction(Signal::SIGTTIN, &sa).unwrap();
+        sigaction(Signal::SIGTTOU, &sa).unwrap();
+    }
+}
+
+fn restore_tty_signals() {
+    let sa = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    unsafe {
+        sigaction(Signal::SIGTSTP, &sa).unwrap();
+        sigaction(Signal::SIGTTIN, &sa).unwrap();
+        sigaction(Signal::SIGTTOU, &sa).unwrap();
     }
 }
